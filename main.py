@@ -68,6 +68,8 @@ def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client
+    if DEV_MODE:
+        logger.warning("DEV_MODE is enabled — upstream responses will be logged at DEBUG level")
     if _http_client is None:
         proxy_url = None
         if USE_PROXIES:
@@ -125,12 +127,31 @@ USER_AGENT = os.getenv(
 
 _TIDAL_DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "application/json",
+    "Accept": "*/*",
     "Accept-Encoding": "gzip",
     "Accept-Language": "en-US,en;q=0.9",
     "X-Platform": "android",
     "X-Tidal-Platform": "android",
 }
+
+DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
+
+_RATE_LIMIT_MAX_RETRIES = 3
+_RATE_LIMIT_BASE_DELAY = 1.0
+_RATE_LIMIT_MAX_DELAY = 10.0
+
+def _log_response(method: str, url: str, resp: httpx.Response):
+    if not DEV_MODE:
+        return
+    logger.info(
+        "[DEV] %s %s → %s\n  headers: %s\n  body: %s",
+        method,
+        url,
+        resp.status_code,
+        dict(resp.headers),
+        resp.text[:2000],
+    )
+
 try:
     MAX_RETRIES = int(_max_retries_raw)
 except ValueError:
@@ -340,6 +361,7 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
                     },
                     auth=(cred["client_id"], cred["client_secret"]),
                 )
+                _log_response("POST", "https://auth.tidal.com/v1/oauth2/token", res)
 
                 if res.status_code in [400, 401]:
                     try:
@@ -395,28 +417,50 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
     headers = {"authorization": f"Bearer {token}"}
 
     try:
-        resp = await client.get(url, headers=headers, params=params)
-
-        if resp.status_code == 401:
-            # Token expired, refresh and retry
-            token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-            headers = {"authorization": f"Bearer {token}"}
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
             resp = await client.get(url, headers=headers, params=params)
+            _log_response("GET", url, resp)
+
+            if resp.status_code == 401:
+                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                headers = {"authorization": f"Bearer {token}"}
+                resp = await client.get(url, headers=headers, params=params)
+                _log_response("GET (retry after 401)", url, resp)
+
+            if resp.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
+                delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(delay, max(float(retry_after), 0))
+                    except ValueError:
+                        pass
+                delay = min(delay, _RATE_LIMIT_MAX_DELAY)
+                logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 404:
+                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                if fresh_token != token:
+                    headers = {"authorization": f"Bearer {fresh_token}"}
+                    resp = await client.get(url, headers=headers, params=params)
+                    _log_response("GET (retry after 404 token refresh)", url, resp)
+                    token, cred = fresh_token, fresh_cred
+
+            break
 
         resp.raise_for_status()
         return {"version": API_VERSION, "data": resp.json()}
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Resource not found")
-        else:
-            logger.error(
-                "Upstream API error %s %s %s",
-                e.response.status_code,
-                url,
-                e.response.text,
-                exc_info=e,
-            )
-            raise HTTPException(status_code=e.response.status_code, detail="Upstream API error")
+        logger.error(
+            "Upstream API error %s %s %s",
+            e.response.status_code,
+            url,
+            e.response.text[:1000],
+            exc_info=e,
+        )
+        raise HTTPException(status_code=e.response.status_code, detail="Upstream API error")
     except httpx.RequestError as e:
         if isinstance(e, httpx.TimeoutException):
             raise HTTPException(status_code=429, detail="Upstream timeout")
@@ -439,20 +483,49 @@ async def authed_get_json(
     headers = {"authorization": f"Bearer {token}"}
 
     try:
-        resp = await client.get(url, headers=headers, params=params)
-
-        if resp.status_code == 401:
-            token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-            headers["authorization"] = f"Bearer {token}"
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
             resp = await client.get(url, headers=headers, params=params)
+            _log_response("GET", url, resp)
+
+            if resp.status_code == 401:
+                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                headers["authorization"] = f"Bearer {token}"
+                resp = await client.get(url, headers=headers, params=params)
+                _log_response("GET (retry after 401)", url, resp)
+
+            if resp.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
+                delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(delay, max(float(retry_after), 0))
+                    except ValueError:
+                        pass
+                delay = min(delay, _RATE_LIMIT_MAX_DELAY)
+                logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 404:
+                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                if fresh_token != token:
+                    headers["authorization"] = f"Bearer {fresh_token}"
+                    resp = await client.get(url, headers=headers, params=params)
+                    _log_response("GET (retry after 404 token refresh)", url, resp)
+                    token, cred = fresh_token, fresh_cred
+
+            break
 
         resp.raise_for_status()
         return resp.json(), token, cred
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Resource not found")
-        if e.response.status_code == 429:
-            raise HTTPException(status_code=429, detail="Upstream rate limited")
+        logger.error(
+            "Upstream API error %s %s %s",
+            e.response.status_code,
+            url,
+            e.response.text[:1000],
+            exc_info=e,
+        )
         raise HTTPException(status_code=e.response.status_code, detail="Upstream API error")
     except httpx.RequestError as e:
         if isinstance(e, httpx.TimeoutException):
@@ -525,11 +598,13 @@ async def widevine_proxy(request: Request):
 
     try:
         resp = await client.request(request.method, url, headers=headers, content=body)
+        _log_response(request.method, url, resp)
 
         if resp.status_code == 401:
             token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
             headers["authorization"] = f"Bearer {token}"
             resp = await client.request(request.method, url, headers=headers, content=body)
+            _log_response(f"{request.method} (retry)", url, resp)
 
         return fastapi.Response(
             content=resp.content,
