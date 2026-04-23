@@ -37,6 +37,9 @@ python3 main.py
 
 By default, it listens on `0.0.0.0:8000` (could be the open internet - beware!).
 
+> [!IMPORTANT]
+> Make sure your `token.json` is in the folder that you RUN the script (do not just double click the script) - or place your creds into `.env`.
+
 ## Notes
 
 ### Region-locking
